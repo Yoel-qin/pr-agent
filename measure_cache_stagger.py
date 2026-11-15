@@ -2,11 +2,21 @@
 
 Runs the real dispatch path — LiteLLMAIHandler.chat_completion for message assembly
 and transport, run_chunk_batch for dispatch, add_token_usage for accounting — against
-a live Anthropic-format endpoint (DeepSeek, which reports cache hits in usage). Each
-phase gets a unique system prefix so it starts cache-cold. Lives on a measurement-only
-branch; never merged.
+a live Anthropic-format endpoint. Each phase gets a unique system prefix so it starts
+cache-cold. Lives on a measurement-only branch; never merged.
 
-Usage: DEEPSEEK_API_KEY=... uv run python measure_cache_stagger.py
+Two modes:
+
+- Claude, through the shipped gate (what the maintainer asked for): put the key and a
+  system injection point in pr_agent/settings/.secrets.toml, then
+  MEASURE_MODEL=anthropic/claude-sonnet-4-5 uv run python measure_cache_stagger.py
+  The staggered phase asks prompt_cache_active() whether to stagger, so the three
+  gates decide exactly as in /review and /improve.
+
+- DeepSeek demo of the ordering mechanism (no "claude" in the model name, so the gate
+  says False by design; MEASURE_FORCE_STAGGER=1 staggers anyway to show the ordering):
+  write the key as [anthropic] key in the same .secrets.toml, set
+  ANTHROPIC_API_BASE=https://api.deepseek.com/anthropic, and run with no MEASURE_MODEL.
 """
 
 import asyncio
@@ -17,16 +27,17 @@ import uuid
 
 sys.path.insert(0, ".")
 
-# The endpoint comes from ANTHROPIC_API_BASE (the handler's own provider routing,
-# PROVIDER_API_BASE_ENV_VARS); a process-wide litellm.api_base is refused on purpose.
-if not os.environ.get("ANTHROPIC_API_BASE"):
+if not os.environ.get("ANTHROPIC_API_BASE") and not os.environ.get("MEASURE_MODEL"):
+    # DeepSeek's Anthropic-format endpoint; the handler routes it through its own
+    # ANTHROPIC_API_BASE provider path (a process-wide litellm.api_base is refused).
     os.environ["ANTHROPIC_API_BASE"] = "https://api.deepseek.com/anthropic"
 
 from pr_agent.algo.ai_handlers.litellm_ai_handler import LiteLLMAIHandler
 from pr_agent.algo.chunk_runner import run_chunk_batch
 from pr_agent.algo.run_details import get_run_details, init_run_details
 
-MODEL = "anthropic/deepseek-chat"
+MODEL = os.environ.get("MEASURE_MODEL", "anthropic/deepseek-chat")
+FORCE_STAGGER = os.environ.get("MEASURE_FORCE_STAGGER") == "1"
 N_CHUNKS = 4
 
 _REVIEW_RULES = [
@@ -88,6 +99,13 @@ async def run_phase(name: str, stagger: bool) -> int:
     tag = uuid.uuid4().hex[:12]
     system = _system_prefix(tag)
     handler = LiteLLMAIHandler()
+    if stagger:
+        # The shipped gate decides, exactly as in /review and /improve: injection
+        # points, a Claude-named model, and the prompt-cache minimum. FORCE_STAGGER is
+        # only for endpoints the gate rightly declines (the DeepSeek ordering demo).
+        gated = handler.prompt_cache_active(MODEL, prompt_tokens=len(system) // 4)
+        stagger = gated or FORCE_STAGGER
+        print(f"prompt_cache_active({MODEL}) = {gated}; stagger_first={stagger}")
     details = init_run_details()
     per_call = []
 
