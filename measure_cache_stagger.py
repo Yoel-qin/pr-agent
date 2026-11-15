@@ -24,7 +24,7 @@ if not os.environ.get("ANTHROPIC_API_BASE"):
 
 from pr_agent.algo.ai_handlers.litellm_ai_handler import LiteLLMAIHandler
 from pr_agent.algo.chunk_runner import run_chunk_batch
-from pr_agent.algo.run_details import add_token_usage, get_run_details, init_run_details
+from pr_agent.algo.run_details import get_run_details, init_run_details
 
 MODEL = "anthropic/deepseek-chat"
 N_CHUNKS = 4
@@ -84,29 +84,6 @@ def _user_chunk(i: int) -> str:
     return f"Review chunk {i + 1} of {N_CHUNKS} of the pull request diff:\n\n```python\n{body}\n{filler}\n```\n"
 
 
-def _usage_fields(usage) -> dict:
-    def read(*names):
-        for name in names:
-            value = getattr(usage, name, None)
-            if isinstance(value, int) and not isinstance(value, bool):
-                return value
-        if isinstance(usage, dict):
-            for name in names:
-                value = usage.get(name)
-                if isinstance(value, int) and not isinstance(value, bool):
-                    return value
-        return 0
-
-    return {
-        "input": read("prompt_tokens", "input_tokens"),
-        "output": read("completion_tokens", "output_tokens"),
-        "cache_read": read(
-            "cache_read_input_tokens", "_cache_read_input_tokens", "prompt_cache_hit_tokens"
-        ),
-        "cache_creation": read("cache_creation_input_tokens", "_cache_creation_input_tokens"),
-    }
-
-
 async def run_phase(name: str, stagger: bool) -> int:
     tag = uuid.uuid4().hex[:12]
     system = _system_prefix(tag)
@@ -115,12 +92,25 @@ async def run_phase(name: str, stagger: bool) -> int:
     per_call = []
 
     async def call(i: int):
+        # chat_completion returns the text; usage is accumulated into run_details by the
+        # handler's own callback path, so attribute each call by differencing the counters.
+        before = get_run_details()
+        before_counts = (before.prompt_tokens, before.completion_tokens,
+                         before.cache_read_tokens, before.cache_creation_tokens) if before else (0, 0, 0, 0)
         started = time.perf_counter()
-        resp, _finish = await handler.chat_completion(MODEL, system, _user_chunk(i))
-        fields = _usage_fields(getattr(resp, "usage", None))
-        fields["seconds"] = round(time.perf_counter() - started, 2)
-        per_call.append(fields)
-        add_token_usage(getattr(resp, "usage", None))
+        await handler.chat_completion(MODEL, system, _user_chunk(i))
+        seconds = round(time.perf_counter() - started, 2)
+        after = get_run_details()
+        counts = (after.prompt_tokens, after.completion_tokens,
+                  after.cache_read_tokens, after.cache_creation_tokens) if after else (0, 0, 0, 0)
+        per_call.append({
+            "chunk": i,
+            "input": counts[0] - before_counts[0],
+            "output": counts[1] - before_counts[1],
+            "cache_read": counts[2] - before_counts[2],
+            "cache_creation": counts[3] - before_counts[3],
+            "seconds": seconds,
+        })
 
     started = time.perf_counter()
     results = await run_chunk_batch(list(range(N_CHUNKS)), call, stagger_first=stagger)
@@ -128,10 +118,10 @@ async def run_phase(name: str, stagger: bool) -> int:
 
     errors = [r for r in results if isinstance(r, Exception)]
     print(f"\n=== {name} (stagger_first={stagger}, prefix tag {tag}) ===")
-    print(f"shared system prefix: {len(system)} chars (~{len(system) // 4} tokens)")
-    for fields in sorted(per_call, key=lambda f: f["seconds"], reverse=True):
+    print(f"shared system prefix: {len(system)} chars")
+    for fields in sorted(per_call, key=lambda f: f["chunk"]):
         print(
-            "  call: in={input} out={output} cache_read={cache_read} "
+            "  chunk {chunk}: in={input} out={output} cache_read={cache_read} "
             "cache_creation={cache_creation} took={seconds}s".format(**fields)
         )
     totals = get_run_details() or details
