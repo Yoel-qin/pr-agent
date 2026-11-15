@@ -17,9 +17,10 @@ import uuid
 
 sys.path.insert(0, ".")
 
-import litellm
-
-litellm.api_base = os.environ.get("DEEPSEEK_ANTHROPIC_BASE", "https://api.deepseek.com/anthropic")
+# The endpoint comes from ANTHROPIC_API_BASE (the handler's own provider routing,
+# PROVIDER_API_BASE_ENV_VARS); a process-wide litellm.api_base is refused on purpose.
+if not os.environ.get("ANTHROPIC_API_BASE"):
+    os.environ["ANTHROPIC_API_BASE"] = "https://api.deepseek.com/anthropic"
 
 from pr_agent.algo.ai_handlers.litellm_ai_handler import LiteLLMAIHandler
 from pr_agent.algo.chunk_runner import run_chunk_batch
@@ -59,6 +60,8 @@ def _system_prefix(tag: str) -> str:
         "Review each chunk independently under the following standing rules:",
     ]
     lines += [f"{i:02d}. {rule}" for i, rule in enumerate(_REVIEW_RULES, 1)]
+    lines += ["Part two — evidence and output discipline:"]
+    lines += [f"{i:02d}. {rule}" for i, rule in enumerate(_REVIEW_RULES, 101)]
     lines += [
         "Answer with a short verdict line and at most three findings.",
         "Findings outside the chunk's files are out of scope and must be dropped.",
@@ -104,7 +107,7 @@ def _usage_fields(usage) -> dict:
     }
 
 
-async def run_phase(name: str, stagger: bool) -> None:
+async def run_phase(name: str, stagger: bool) -> int:
     tag = uuid.uuid4().hex[:12]
     system = _system_prefix(tag)
     handler = LiteLLMAIHandler()
@@ -141,11 +144,15 @@ async def run_phase(name: str, stagger: bool) -> None:
     print(f"wall: {wall:.2f}s  errors: {len(errors)}")
     for error in errors:
         print(f"  error: {type(error).__name__}: {error}")
+    return len(errors)
 
 
 async def main() -> None:
-    await run_phase("baseline: plain parallel dispatch (main today)", stagger=False)
-    await run_phase("staggered first chunk (this PR)", stagger=True)
+    failures = 0
+    failures += await run_phase("baseline: plain parallel dispatch (main today)", stagger=False)
+    failures += await run_phase("staggered first chunk (this PR)", stagger=True)
+    if failures:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

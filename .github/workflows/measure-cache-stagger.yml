@@ -31,4 +31,5 @@ jobs:
       - name: Run the before/after measurement
         env:
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          ANTHROPIC_API_BASE: https://api.deepseek.com/anthropic
         run: uv run python measure_cache_stagger.py
